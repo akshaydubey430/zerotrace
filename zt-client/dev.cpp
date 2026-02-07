@@ -2,7 +2,25 @@
 #include <iostream>
 #include <filesystem>
 #include <fstream>
-#include <algorithm>
+#include <cstdio>
+#include <memory>
+#include <array>
+
+static std::string runCommand(const std::string& cmd) {
+    std::array<char, 4096> buffer{};
+    std::string result;
+
+    std::unique_ptr<FILE, decltype(&pclose)>
+        pipe(popen(cmd.c_str(), "r"), pclose);
+
+    if (!pipe) return "";
+
+    while (fgets(buffer.data(), buffer.size(), pipe.get())) {
+        result += buffer.data();
+    }
+    return result;
+}
+
 
 namespace fs = std::filesystem;
 
@@ -18,6 +36,37 @@ static std::string readFileLine(const fs::path& path) {
     }
     return "";
 }
+
+
+static bool supportsATASE(const std::string& devPath) {
+    std::string out = runCommand("hdparm -I " + devPath + " 2>/dev/null");
+
+    if (out.empty()) return false;
+
+    if (out.find("Security:") != std::string::npos &&
+        out.find("supported") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
+static bool probeNVMe(const std::string& devPath) {
+    std::string out = runCommand("nvme id-ctrl " + devPath + " 2>/dev/null");
+
+    auto pos = out.find("sanicap");
+    if (pos != std::string::npos) {
+        auto hexPos = out.find("0x", pos);
+        if (hexPos != std::string::npos) {
+            unsigned sanicap = std::stoul(
+                out.substr(hexPos + 2), nullptr, 16);
+            if (sanicap != 0)
+                return true;
+        }
+    }
+
+    return false;
+}
+
 
 std::vector<Device> getDevices() {
     std::vector<Device> devices;
@@ -61,27 +110,11 @@ std::vector<Device> getDevices() {
         dev.isRemovable = (readFileLine(entry.path() / "removable") == "1");
         dev.isReadOnly = (readFileLine(entry.path() / "ro") == "1");
         
-        // Try to get model
-        // Path varies: /sys/block/sda/device/model or /sys/block/nvme0n1/device/model
         dev.model = readFileLine(entry.path() / "device" / "model");
-        if (dev.model.empty()) {
-             // Try a deeper search or alternate path if needed, 
-             // but 'device/model' covers most ATA/SCSI.
-             // NVMe often puts model in /sys/class/nvme/nvmeX/model or similar, 
-             // but /sys/block/nvme0n1/device/model acts as a symlink or direct path often.
-             // Let's check the specific NVMe path from my previous 'ls' output:
-             // It showed /sys/block/nvme0n1/device/model
-             // So this should work.
-        }
-
         // Determine Type
         if (deviceName.rfind("nvme", 0) == 0) {
             dev.type = "NVMe";
         } else if (deviceName.rfind("sd", 0) == 0) {
-            // Could be SATA, SAS, or USB.
-            // Check if usb exists in the device path
-            // realpath /sys/block/sdX/device
-            // This is a bit complex to do perfectly portable, simple heuristic:
             dev.type = "ATA/SCSI"; // Broad category
         } else if (deviceName.rfind("mmcblk", 0) == 0) {
             dev.type = "SD/MMC";
@@ -89,19 +122,16 @@ std::vector<Device> getDevices() {
             dev.type = "Unknown";
         }
 
-        // Determine Supported Wipe Methods
         // All writable block devices support overwrite
         if (!dev.isReadOnly) {
             dev.supportedWipeMethods.push_back(WipeMethod::PLAIN_OVERWRITE);
             dev.supportedWipeMethods.push_back(WipeMethod::ENCRYPTED_OVERWRITE);
             
             // Heuristic for Firmware Erase
-            if (dev.type == "NVMe") {
-                // Assume NVMe supports sanitize commands
+            if (dev.type == "NVMe" && probeNVMe(dev.path)) {
                 dev.supportedWipeMethods.push_back(WipeMethod::FIRMWARE_ERASE);
-            } else if (dev.type == "ATA/SCSI") {
-                // Assume ATA supports Secure Erase (though it might be frozen)
-                dev.supportedWipeMethods.push_back(WipeMethod::FIRMWARE_ERASE);
+            } else if (dev.type == "ATA/SCSI" && supportsATASE(dev.path)) {
+                dev.supportedWipeMethods.push_back(WipeMethod::ATA_SECURE_ERASE);
             }
         }
 

@@ -8,7 +8,7 @@ include_directories(include)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK4 REQUIRED gtk4)
 
-add_executable(zt-client main.cpp dev.cpp gui.cpp)
+add_executable(zt-client main.cpp dev.cpp wipe.cpp gui.cpp)
 target_include_directories(zt-client PRIVATE include ${GTK4_INCLUDE_DIRS})
 target_link_libraries(zt-client PRIVATE ${GTK4_LIBRARIES})
 target_compile_options(zt-client PRIVATE ${GTK4_CFLAGS_OTHER})
