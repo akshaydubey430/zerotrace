@@ -1,0 +1,9 @@
+{
+    "device_id": "DEV-001",
+    "device_model": "Samsung 980 Pro",
+    "device_size_bytes": 1000000000,
+    "wipe_method": "ATA_SECURE_ERASE",
+    "timestamp": 1770485413,
+    "status": "SUCCESS",
+    "issuer": "ZeroTrace Verification System"
+}
