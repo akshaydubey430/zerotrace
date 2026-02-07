@@ -8,8 +8,7 @@
 enum class WipeMethod {
     PLAIN_OVERWRITE,
     ENCRYPTED_OVERWRITE,
-    FIRMWARE_ERASE,
-    ATA_SECURE_ERASE
+    FIRMWARE_ERASE
 };
 
 struct Device {
@@ -28,4 +27,3 @@ std::vector<Device> getDevices();
 void printDeviceList(const std::vector<Device>& devices);
 
 #endif
-
