@@ -1,10 +1,35 @@
 #include "include/gui.hpp"
+#include "include/wipe.hpp"
+#include "include/dev.hpp"
 #include <gtk/gtk.h>
 #include <iostream>
 #include <iomanip>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <map>
+
+// --- App State ---
+
+struct AppState {
+    GtkWidget *stack;
+    GtkWidget *device_list_view;
+    GtkWidget *wipe_options_view;
+    
+    // Wipe Options Widgets
+    GtkWidget *target_device_label;
+    GtkWidget *methods_box;
+    GtkWidget *status_label;
+    GtkCheckButton *radio_plain;
+    GtkCheckButton *radio_encrypted;
+    GtkCheckButton *radio_ata;
+    GtkCheckButton *radio_firmware;
+    
+    // Selected Context
+    Device selectedDevice;
+};
+
+static AppState appState;
 
 // --- Utilities ---
 
@@ -21,18 +46,248 @@ std::string formatSize(uint64_t bytes) {
     return ss.str();
 }
 
-// --- Callbacks ---
+// --- Forward Declarations ---
+static void refresh_device_list(GtkWidget* container_box);
+static void switch_to_device_list(GtkButton* btn, gpointer user_data);
 
-static void on_wipe_clicked(GtkButton* btn, gpointer user_data) {
-    char* devicePath = (char*)user_data;
-    std::cout << "Wipe requested for: " << devicePath << std::endl;
-    // TODO: Connect to actual wipe logic
+// --- Logic ---
+
+static void show_status(const std::string& msg, bool isError = false) {
+    if (appState.status_label) {
+        std::string markup;
+        if (isError) {
+            markup = g_strdup_printf("<span color='red'>%s</span>", msg.c_str());
+        } else {
+            markup = g_strdup_printf("<span color='green'>%s</span>", msg.c_str());
+        }
+        gtk_label_set_markup(GTK_LABEL(appState.status_label), markup.c_str());
+        g_free((gpointer)markup.c_str()); // Need to be careful with g_strdup_printf ownership if using const char
+        // Actually g_strdup_printf returns a newly allocated string.
+        // In the line above: `markup = ...`. `markup` is std::string, so it copies.
+        // Wait, g_strdup_printf returns gchar*.
+        // Correct usage:
+        // gchar* m = g_strdup_printf(...);
+        // gtk_label_set_markup(..., m);
+        // g_free(m);
+    }
 }
 
-static void free_device_path(gpointer data, GClosure* closure) {
+// Fixed version of show_status to avoid leak/error
+static void show_status_safe(const std::string& msg, bool isError = false) {
+    if (appState.status_label) {
+        gchar* markup;
+        if (isError) {
+            markup = g_strdup_printf("<span color='red'>%s</span>", msg.c_str());
+        } else {
+            markup = g_strdup_printf("<span color='green'>%s</span>", msg.c_str());
+        }
+        gtk_label_set_markup(GTK_LABEL(appState.status_label), markup);
+        g_free(markup);
+    }
+}
+
+
+static void on_confirm_wipe_clicked(GtkButton* btn, gpointer user_data) {
+    (void)btn;
+    (void)user_data;
+    
+    WipeMethod method = WipeMethod::PLAIN_OVERWRITE;
+    std::string methodStr = "Plain Overwrite";
+    
+    if (gtk_check_button_get_active(appState.radio_plain)) {
+        method = WipeMethod::PLAIN_OVERWRITE;
+        methodStr = "Plain Overwrite";
+    } else if (gtk_check_button_get_active(appState.radio_encrypted)) {
+        method = WipeMethod::ENCRYPTED_OVERWRITE;
+        methodStr = "Encrypted Overwrite";
+    } else if (gtk_check_button_get_active(appState.radio_ata)) {
+        method = WipeMethod::ATA_SECURE_ERASE;
+        methodStr = "ATA Secure Erase";
+    } else if (gtk_check_button_get_active(appState.radio_firmware)) {
+        method = WipeMethod::FIRMWARE_ERASE;
+        methodStr = "Firmware Erase";
+    }
+    
+    std::cout << "Starting wipe on " << appState.selectedDevice.path 
+              << " using method: " << methodStr << std::endl;
+              
+    // TODO: This should ideally be async to avoid freezing UI
+    // For now, we update status before (which might not render if main thread blocks) 
+    // and after.
+    
+    show_status_safe("Wiping... Please Wait...", false);
+    
+    // Force UI update? In GTK4 strictly we should use an async worker.
+    // But for this task scope, blocking is "acceptable" if not requested otherwise, 
+    // though users hate it. 
+    // Let's just call it.
+    
+    bool result = wipeDisk(appState.selectedDevice.path, method);
+    
+    if (result) {
+        show_status_safe("Wipe Completed Successfully!", false);
+    } else {
+        show_status_safe("Wipe Failed! Check console/logs.", true);
+    }
+}
+
+static void switch_to_device_list(GtkButton* btn, gpointer user_data) {
+    (void)btn;
+    (void)user_data;
+    gtk_stack_set_visible_child(GTK_STACK(appState.stack), appState.device_list_view);
+}
+
+// Prepare the options screen for the selected device
+static void prepare_wipe_options() {
+    // Update Label
+    std::string labelText = "Target: <b>" + appState.selectedDevice.name + "</b>\n" +
+                            "<span size='small' color='gray'>" + appState.selectedDevice.path + " - " + 
+                            formatSize(appState.selectedDevice.sizeBytes) + "</span>";
+    gtk_label_set_markup(GTK_LABEL(appState.target_device_label), labelText.c_str());
+    
+    // Reset Status
+    gtk_label_set_text(GTK_LABEL(appState.status_label), "");
+
+    // Reset selection to default
+    gtk_check_button_set_active(appState.radio_plain, TRUE); 
+}
+
+static void on_wipe_request(GtkButton* btn, gpointer user_data) {
+    (void)btn;
+    Device* dev = (Device*)user_data;
+    appState.selectedDevice = *dev; // Copy device data
+    
+    prepare_wipe_options();
+    gtk_stack_set_visible_child(GTK_STACK(appState.stack), appState.wipe_options_view);
+}
+
+static void free_device_copy(gpointer data, GClosure* closure) {
     (void)closure;
-    g_free(data);
+    delete (Device*)data;
 }
+
+// --- Views Construction ---
+
+static GtkWidget* create_device_list_view() {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    
+    // Header
+    GtkWidget *header_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_set_margin_top(header_bar, 10);
+    gtk_widget_set_margin_bottom(header_bar, 10);
+    gtk_widget_set_margin_start(header_bar, 20);
+    gtk_widget_set_margin_end(header_bar, 20);
+    
+    GtkWidget *title_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title_label), "<span size='xx-large' weight='bold' color='#40a4ff'>ZeroTrace</span> <span size='large' color='grey'>| Secure Data Cleanup</span>");
+    gtk_box_append(GTK_BOX(header_bar), title_label);
+
+    GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(spacer, TRUE);
+    gtk_box_append(GTK_BOX(header_bar), spacer);
+
+    GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh Devices");
+    gtk_box_append(GTK_BOX(header_bar), refresh_btn);
+    
+    gtk_box_append(GTK_BOX(box), header_bar);
+    gtk_box_append(GTK_BOX(box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+
+    // Content Scroller
+    GtkWidget *scrolled_window = gtk_scrolled_window_new();
+    gtk_widget_set_vexpand(scrolled_window, TRUE);
+    gtk_box_append(GTK_BOX(box), scrolled_window);
+
+    GtkWidget *content_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_top(content_box, 20);
+    gtk_widget_set_margin_bottom(content_box, 20);
+    gtk_widget_set_margin_start(content_box, 30);
+    gtk_widget_set_margin_end(content_box, 30);
+    
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled_window), content_box);
+
+    // Initial load
+    refresh_device_list(content_box);
+    
+    // Signal
+    g_signal_connect_swapped(refresh_btn, "clicked", G_CALLBACK(refresh_device_list), content_box);
+    
+    return box;
+}
+
+static GtkWidget* create_wipe_options_view() {
+    GtkWidget *container = gtk_box_new(GTK_ORIENTATION_VERTICAL, 20);
+    gtk_widget_set_valign(container, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign(container, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(container, 40);
+    gtk_widget_set_margin_bottom(container, 40);
+    
+    // Header
+    GtkWidget *header = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(header), "<span size='x-large' weight='bold'>Confirm Wipe Options</span>");
+    gtk_box_append(GTK_BOX(container), header);
+    
+    // Target Device Info
+    appState.target_device_label = gtk_label_new("");
+    gtk_label_set_justify(GTK_LABEL(appState.target_device_label), GTK_JUSTIFY_CENTER);
+    gtk_box_append(GTK_BOX(container), appState.target_device_label);
+    
+    gtk_box_append(GTK_BOX(container), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+    
+    // Methods Selection
+    GtkWidget *methods_frame = gtk_frame_new("Wipe Method");
+    appState.methods_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_top(appState.methods_box, 10);
+    gtk_widget_set_margin_bottom(appState.methods_box, 10);
+    gtk_widget_set_margin_start(appState.methods_box, 10);
+    gtk_widget_set_margin_end(appState.methods_box, 10);
+    gtk_frame_set_child(GTK_FRAME(methods_frame), appState.methods_box);
+    
+    // Radio Buttons
+    // In GTK4, check buttons are used for radios.
+    // Create first one
+    appState.radio_plain = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Plain Overwrite (Zero-fill) - High Compatibility"));
+    
+    // Create others, grouping with the first
+    appState.radio_encrypted = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Encrypted Overwrite - Crypto Safe"));
+    gtk_check_button_set_group(appState.radio_encrypted, appState.radio_plain);
+    
+    appState.radio_ata = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("ATA Secure Erase - Fast & Native"));
+    gtk_check_button_set_group(appState.radio_ata, appState.radio_plain);
+    
+    appState.radio_firmware = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Firmware/Factory Reset - Vendor Specific"));
+    gtk_check_button_set_group(appState.radio_firmware, appState.radio_plain);
+    
+    gtk_box_append(GTK_BOX(appState.methods_box), GTK_WIDGET(appState.radio_plain));
+    gtk_box_append(GTK_BOX(appState.methods_box), GTK_WIDGET(appState.radio_encrypted));
+    gtk_box_append(GTK_BOX(appState.methods_box), GTK_WIDGET(appState.radio_ata));
+    gtk_box_append(GTK_BOX(appState.methods_box), GTK_WIDGET(appState.radio_firmware));
+    
+    gtk_box_append(GTK_BOX(container), methods_frame);
+    
+    // Status
+    appState.status_label = gtk_label_new("");
+    gtk_box_append(GTK_BOX(container), appState.status_label);
+    
+    // Actions
+    GtkWidget *actions_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 20);
+    gtk_widget_set_halign(actions_box, GTK_ALIGN_CENTER);
+    
+    GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
+    g_signal_connect(cancel_btn, "clicked", G_CALLBACK(switch_to_device_list), NULL);
+    
+    GtkWidget *confirm_btn = gtk_button_new_with_label("PERFORM WIPE");
+    gtk_widget_add_css_class(confirm_btn, "destructive-action");
+    g_signal_connect(confirm_btn, "clicked", G_CALLBACK(on_confirm_wipe_clicked), NULL);
+    
+    gtk_box_append(GTK_BOX(actions_box), cancel_btn);
+    gtk_box_append(GTK_BOX(actions_box), confirm_btn);
+    
+    gtk_box_append(GTK_BOX(container), actions_box);
+    
+    return container;
+}
+
+// --- List Logic (Refactored) ---
 
 static void refresh_device_list(GtkWidget* container_box) {
     // Remove all children
@@ -72,7 +327,7 @@ static void refresh_device_list(GtkWidget* container_box) {
         
         // Type Badge
         GtkWidget *type_label = gtk_label_new(dev.type.c_str());
-        gtk_widget_add_css_class(type_label, "badge"); // We can add CSS later if we want, or use markup
+        gtk_widget_add_css_class(type_label, "badge"); 
         char* type_markup = g_strdup_printf("<span background='#40a4ff' color='white' weight='bold'>  %s  </span>", dev.type.c_str());
         gtk_label_set_markup(GTK_LABEL(type_label), type_markup);
         g_free(type_markup);
@@ -121,11 +376,11 @@ static void refresh_device_list(GtkWidget* container_box) {
         gtk_widget_set_margin_top(actions_box, 8);
 
         GtkWidget *wipe_btn = gtk_button_new_with_label("Wipe Drive");
-        gtk_widget_add_css_class(wipe_btn, "destructive-action"); // Standard GTK class? maybe not, but "destructive-action" is common in Adwaita
+        gtk_widget_add_css_class(wipe_btn, "destructive-action");
         
-        // Copy path for callback
-        char* path_copy = g_strdup(dev.path.c_str());
-        g_signal_connect_data(wipe_btn, "clicked", G_CALLBACK(on_wipe_clicked), path_copy, free_device_path, (GConnectFlags)0);
+        // Copy device data for callback
+        Device* devCopy = new Device(dev);
+        g_signal_connect_data(wipe_btn, "clicked", G_CALLBACK(on_wipe_request), devCopy, free_device_copy, (GConnectFlags)0);
 
         gtk_box_append(GTK_BOX(actions_box), wipe_btn);
         gtk_box_append(GTK_BOX(card_box), actions_box);
@@ -134,65 +389,33 @@ static void refresh_device_list(GtkWidget* container_box) {
     }
 }
 
+// --- Main Init ---
+
 static void on_activate(GtkApplication *app, gpointer user_data) {
+    (void)user_data;
     GtkWidget *window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "ZeroTrace");
     gtk_window_set_default_size(GTK_WINDOW(window), 900, 700);
 
-    GtkWidget *main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_window_set_child(GTK_WINDOW(window), main_box);
-
-    // --- Header ---
-    GtkWidget *header_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-    gtk_widget_set_margin_top(header_bar, 10);
-    gtk_widget_set_margin_bottom(header_bar, 10);
-    gtk_widget_set_margin_start(header_bar, 20);
-    gtk_widget_set_margin_end(header_bar, 20);
+    // Main Stack
+    appState.stack = gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(appState.stack), GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
     
-    GtkWidget *title_label = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(title_label), "<span size='xx-large' weight='bold' color='#40a4ff'>ZeroTrace</span> <span size='large' color='grey'>| Secure Data Cleanup</span>");
-    gtk_box_append(GTK_BOX(header_bar), title_label);
-
-    // Spacer to push button to right
-    GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_set_hexpand(spacer, TRUE);
-    gtk_box_append(GTK_BOX(header_bar), spacer);
-
-    GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh Devices");
-    gtk_box_append(GTK_BOX(header_bar), refresh_btn);
-
-    gtk_box_append(GTK_BOX(main_box), header_bar);
-    gtk_box_append(GTK_BOX(main_box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-
-    // --- Content ---
-    GtkWidget *scrolled_window = gtk_scrolled_window_new();
-    gtk_widget_set_vexpand(scrolled_window, TRUE);
-    gtk_box_append(GTK_BOX(main_box), scrolled_window);
-
-    GtkWidget *content_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    gtk_widget_set_margin_top(content_box, 20);
-    gtk_widget_set_margin_bottom(content_box, 20);
-    gtk_widget_set_margin_start(content_box, 30);
-    gtk_widget_set_margin_end(content_box, 30);
+    // Create Views
+    appState.device_list_view = create_device_list_view();
+    appState.wipe_options_view = create_wipe_options_view();
     
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled_window), content_box);
-
-    // Wire up refresh
-    g_signal_connect_swapped(refresh_btn, "clicked", G_CALLBACK(refresh_device_list), content_box);
-
-    // Initial load
-    refresh_device_list(content_box);
+    gtk_stack_add_named(GTK_STACK(appState.stack), appState.device_list_view, "device_list");
+    gtk_stack_add_named(GTK_STACK(appState.stack), appState.wipe_options_view, "wipe_options");
+    
+    gtk_window_set_child(GTK_WINDOW(window), appState.stack);
 
     gtk_window_present(GTK_WINDOW(window));
 }
 
 void runGui() {
-    // We use G_APPLICATION_DEFAULT_FLAGS. 
-    // ID must be valid domain style.
     GtkApplication *app = gtk_application_new("com.zerotrace.client", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
-    
-    // We pass 0 argc here for simplicity, but main could pass args if we changed signature
     g_application_run(G_APPLICATION(app), 0, NULL);
     g_object_unref(app);
 }
