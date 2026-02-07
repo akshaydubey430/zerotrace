@@ -12,6 +12,22 @@
 
 #define MP_NUM_PASSES 3
 
+#include <sys/wait.h>
+#include <vector>
+#include <cstring>
+
+static bool runHdparm(const std::vector<const char*>& args) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execvp(args[0], const_cast<char* const*>(args.data()));
+        _exit(127);
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 bool mpOverwrite(const std::string& devicePath){
     int fd = open(devicePath.c_str(), O_WRONLY | O_SYNC);
     if (fd < 0) {
@@ -63,12 +79,55 @@ bool mpOverwrite(const std::string& devicePath){
     return true;
 }
 
+
+bool ataSecureErase(const std::string& devicePath) {
+    const char* hdparm = "hdparm";
+    const char* pass   = "wipe";
+
+    /* Step 1: check security state */
+    if (!runHdparm({hdparm, "-I", devicePath.c_str(), nullptr})) {
+        std::cerr << "Failed to read drive identity\n";
+        return false;
+    }
+
+    /* Step 2: set temporary password */
+    if (!runHdparm({
+            hdparm,
+            "--user-master", "u",
+            "--security-set-pass", pass,
+            devicePath.c_str(),
+            nullptr
+        })) {
+        std::cerr << "Failed to set ATA security password\n";
+        return false;
+    }
+
+    /* Step 3: issue secure erase */
+    std::cout << "Starting ATA Secure Erase on " << devicePath << "\n";
+
+    if (!runHdparm({
+            hdparm,
+            "--user-master", "u",
+            "--security-erase", pass,
+            devicePath.c_str(),
+            nullptr
+        })) {
+        std::cerr << "ATA Secure Erase failed\n";
+        return false;
+    }
+
+    std::cout << "ATA Secure Erase completed successfully\n";
+    return true;
+}
+
+
+
 bool wipeDisk(const std::string& devicePath, WipeMethod
         method){
 
     switch(method){
         case WipeMethod::ATA_SECURE_ERASE:
-            break;
+            return ataSecureErase(devicePath);
         case WipeMethod::FIRMWARE_ERASE:
             break;
         case WipeMethod::PLAIN_OVERWRITE:
@@ -79,5 +138,5 @@ bool wipeDisk(const std::string& devicePath, WipeMethod
             std::cout << "Unsupported Wipe Method\n";
 
     }
-
+    return false;
 }
