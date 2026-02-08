@@ -1,18 +1,18 @@
-import express from "express";
-import { ethers } from "ethers";
-import "dotenv/config";
-import fs from "fs";
-
+const express = require('express');
+const { ethers } = require('ethers');
+const dotenv = require('dotenv');
+dotenv.config();
+const fs = require('fs');
 const app = express();
 app.use(express.json());
 
 // CONFIG
 const RPC_URL = "http://127.0.0.1:8545";
-const PRIVATE_KEY = process.env.ZT_WIPE_PRIVKEY;
-const CONTRACT_ADDR = "0x5FbDB2315678afecb367f032d93F642f64180aa";
+const PRIVATE_KEY = process.env.PRIVATE_KEY ? process.env.PRIVATE_KEY.trim() : null;
+const CONTRACT_ADDR = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
 
 if (!PRIVATE_KEY) {
-  throw new Error("ZT_WIPE_PRIVKEY not set");
+  throw new Error("PRIVATE_KEY not set");
 }
 
 // Load ABI synchronously
