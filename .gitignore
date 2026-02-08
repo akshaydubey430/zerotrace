@@ -1,1 +1,3 @@
 build/
+zt-verify/node_modules
+zt-chain/node_modules

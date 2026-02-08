@@ -1,4 +1,5 @@
 #include "include/wipe.hpp"
+#include "include/cert.hpp"
 #include "include/dev.hpp"
 #include <fcntl.h>
 #include <unistd.h>
@@ -120,23 +121,99 @@ bool ataSecureErase(const std::string& devicePath) {
     return true;
 }
 
+static bool runNvme(const std::vector<const char*>& args) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execvp(args[0], const_cast<char* const*>(args.data()));
+        _exit(127);
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
 
 
-bool wipeDisk(const std::string& devicePath, WipeMethod
+bool nvmeSanitize(const std::string& devicePath) {
+    const char* nvme = "nvme";
+
+    /* Step 1: sanity check – identify controller */
+    if (!runNvme({nvme, "id-ctrl", devicePath.c_str(), nullptr})) {
+        std::cerr << "Failed to identify NVMe controller\n";
+        return false;
+    }
+
+    /*
+     * Step 2: attempt crypto erase first
+     * -a 4 = crypto erase
+     * --force required by nvme-cli for destructive ops
+     */
+    std::cout << "Attempting NVMe crypto sanitize...\n";
+
+    if (runNvme({
+            nvme,
+            "sanitize",
+            devicePath.c_str(),
+            "-a", "4",
+            "--force",
+            nullptr
+        })) {
+        std::cout << "NVMe crypto sanitize completed\n";
+        return true;
+    }
+
+    /*
+     * Step 3: fallback to block erase
+     * -a 2 = block erase
+     */
+    std::cout << "Crypto sanitize unsupported, falling back to block erase...\n";
+
+    if (!runNvme({
+            nvme,
+            "sanitize",
+            devicePath.c_str(),
+            "-a", "2",
+            "--force",
+            nullptr
+        })) {
+        std::cerr << "NVMe sanitize failed\n";
+        return false;
+    }
+
+    std::cout << "NVMe block sanitize completed\n";
+    return true;
+}
+
+WipeResult wipeDisk(const std::string& devicePath, WipeMethod
         method){
+
+    WipeResult result = {};
+    result.device_path = devicePath;
+    result.method = method;
+    result.start_time = time(nullptr);
+    result.tool_version = "zt-wipe 1.0";
+
+    bool ok = false;
 
     switch(method){
         case WipeMethod::ATA_SECURE_ERASE:
-            return ataSecureErase(devicePath);
+            ok = ataSecureErase(devicePath);
+            break;
         case WipeMethod::FIRMWARE_ERASE:
+            ok = nvmeSanitize(devicePath);
             break;
         case WipeMethod::PLAIN_OVERWRITE:
-            return mpOverwrite(devicePath);
+            ok = mpOverwrite(devicePath);
+            break;
         case WipeMethod::ENCRYPTED_OVERWRITE:
             break;
         default:
             std::cout << "Unsupported Wipe Method\n";
 
     }
-    return false;
+
+
+    result.end_time = time(nullptr);
+    result.status = ok ? WipeStatus::SUCCESS : WipeStatus::FAILURE;
+    return result;
 }
